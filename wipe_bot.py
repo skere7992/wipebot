@@ -211,15 +211,31 @@ class WipeAnnouncerBot(commands.Bot):
             from rcon.source import Client
             import asyncio
             
-            # Run in executor to avoid blocking
+            # Run in executor to avoid blocking with timeout
             loop = asyncio.get_event_loop()
             
             def run_command():
-                with Client(server.ip, server.rcon_port, passwd=server.rcon_password) as client:
-                    return client.run(command)
+                try:
+                    # Add timeout to connection
+                    with Client(server.ip, server.rcon_port, passwd=server.rcon_password, timeout=5) as client:
+                        response = client.run(command)
+                        return response
+                except Exception as e:
+                    logger.error(f"RCON connection error: {e}")
+                    raise e
             
-            response = await loop.run_in_executor(None, run_command)
-            return response
+            # Add timeout to the entire operation
+            try:
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(None, run_command),
+                    timeout=10.0
+                )
+                logger.info(f"RCON command successful for {server.name}: {command}")
+                return response
+            except asyncio.TimeoutError:
+                logger.error(f"RCON timeout for {server.name}")
+                return None
+                
         except Exception as e:
             logger.error(f"RCON error for {server.name}: {e}")
             return None
@@ -366,22 +382,42 @@ class WipeCommands(commands.Cog):
         
         await view.wait()
         
-        if view.selected_type:
-            success = await self.bot.set_wipe_type(server_name, view.selected_type, interaction.user)
-            if success:
-                embed = discord.Embed(
-                    title="✅ Wipe Type Set",
-                    description=f"**Server:** {server_name}\n"
-                               f"**Type:** {WipeType.get_emoji(view.selected_type)} {WipeType.get_display_name(view.selected_type)}\n"
-                               f"**Set by:** {interaction.user.mention}",
-                    color=discord.Color.green(),
-                    timestamp=datetime.datetime.utcnow()
-                )
-                await interaction.edit_original_response(embed=embed, view=None)
-            else:
-                await interaction.edit_original_response(content="❌ Failed to set wipe type. Check RCON connection.", embed=None, view=None)
+    if view.selected_type:
+        # Show loading message
+        loading_embed = discord.Embed(
+            title="⏳ Setting Wipe Type",
+            description=f"Connecting to {server_name}...",
+            color=discord.Color.yellow()
+        )
+        await interaction.edit_original_response(embed=loading_embed, view=None)
+        
+        success = await self.bot.set_wipe_type(server_name, view.selected_type, interaction.user)
+        
+        if success:
+            embed = discord.Embed(
+                title="✅ Wipe Type Set",
+                description=f"**Server:** {server_name}\n"
+                           f"**Type:** {WipeType.get_emoji(view.selected_type)} {WipeType.get_display_name(view.selected_type)}\n"
+                           f"**Set by:** {interaction.user.mention}",
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await interaction.edit_original_response(embed=embed)
         else:
-            await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
+            error_embed = discord.Embed(
+                title="❌ Failed to Set Wipe Type",
+                description=f"Could not connect to **{server_name}**\n\n"
+                           f"**Possible issues:**\n"
+                           f"• Wrong RCON password\n"
+                           f"• Wrong IP or port\n"
+                           f"• Server is offline\n"
+                           f"• RCON is disabled on the server\n\n"
+                           f"Check your `config.json` settings.",
+                color=discord.Color.red()
+            )
+            await interaction.edit_original_response(embed=error_embed)
+    else:
+        await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
     
     @app_commands.command(name='wipestatus', description='Check wipe status for servers')
     @app_commands.autocomplete(server=server_autocomplete)
