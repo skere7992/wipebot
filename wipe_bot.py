@@ -196,8 +196,11 @@ class WipeAnnouncerBot(commands.Bot):
         try:
             from aiorcon import RCON
             
-            rcon = RCON(server.ip, server.rcon_port, server.rcon_password)
-            await rcon.connect()
+            rcon = await RCON.create(
+                host=server.ip,
+                port=server.rcon_port,
+                password=server.rcon_password
+            )
             response = await rcon(command)
             rcon.close()
             return response
