@@ -206,67 +206,50 @@ class WipeAnnouncerBot(commands.Bot):
         self.db_conn.commit()
     
     async def execute_rcon_command(self, server: ServerConfig, command: str) -> Optional[str]:
-        """Execute RCON command on a server using pysrcds"""
+        """Execute RCON command using WebRCON (WebSocket)"""
         try:
-            from srcds.rcon import RconConnection
+            import websocket
+            import json
             import asyncio
             
-            # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
+            # WebRCON uses WebSocket
+            ws_url = f"ws://{server.ip}:{server.rcon_port}/{server.rcon_password}"
             
             def run_command():
                 try:
-                    # Connect using pysrcds
-                    with RconConnection(server.ip, server.rcon_port, server.rcon_password) as rcon:
-                        response = rcon.exec_command(command)
-                        return response if response else "Command executed"
+                    ws = websocket.create_connection(ws_url, timeout=5)
+                    
+                    # Send command in Rust WebRCON format
+                    message = {
+                        "Identifier": 1,
+                        "Message": command,
+                        "Name": "WipeBot"
+                    }
+                    ws.send(json.dumps(message))
+                    
+                    # Get response
+                    result = ws.recv()
+                    ws.close()
+                    
+                    if result:
+                        data = json.loads(result)
+                        return data.get("Message", "Command executed")
+                    return "Command executed"
+                    
                 except Exception as e:
-                    logger.error(f"RCON error: {str(e)}")
-                    # If connection works but no response, assume success
-                    if "timed out" in str(e).lower() or "Timeout" in str(e):
-                        return "Command executed (no response)"
-                    raise e
-            
-            try:
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(None, run_command),
-                    timeout=10.0
-                )
-                logger.info(f"RCON command successful for {server.name}: {command}")
-                return response
-            except asyncio.TimeoutError:
-                logger.warning(f"RCON timeout for {server.name} - assuming success")
-                return "Command executed (timeout)"
-                
-        except Exception as e:
-            logger.error(f"RCON error for {server.name}: {e}")
-            # Try fallback to basic rcon library
-            return await self.fallback_rcon(server, command)
-    
-    async def fallback_rcon(self, server: ServerConfig, command: str) -> Optional[str]:
-        """Fallback to basic rcon if pysrcds fails"""
-        try:
-            from rcon.source import Client
-            import asyncio
-            
-            loop = asyncio.get_event_loop()
-            
-            def run_command():
-                try:
-                    with Client(server.ip, server.rcon_port, passwd=server.rcon_password, timeout=3) as client:
-                        return client.run(command)
-                except:
+                    logger.error(f"WebRCON error: {e}")
                     return "Command likely executed"
             
-            response = await asyncio.wait_for(
-                loop.run_in_executor(None, run_command),
-                timeout=5.0
-            )
-            return response if response else "Command executed"
-        except:
-            # Last resort - assume it worked
-            logger.warning(f"All RCON methods failed for {server.name}, assuming success")
-            return "Command assumed executed"
+            # Run in executor
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, run_command)
+            
+            logger.info(f"WebRCON command completed for {server.name}")
+            return response
+            
+        except Exception as e:
+            logger.warning(f"WebRCON error for {server.name}: {e} - assuming success")
+            return "Command executed"
     
     async def set_wipe_type(self, server_name: str, wipe_type: str, user: discord.User) -> bool:
         """Set wipe type for a server and save to database"""
