@@ -6,7 +6,6 @@ import json
 import sqlite3
 import datetime
 from typing import Optional, Dict, List
-from aiorcon import RCON
 import logging
 from dataclasses import dataclass, asdict
 import os
