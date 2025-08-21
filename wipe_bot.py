@@ -206,38 +206,66 @@ class WipeAnnouncerBot(commands.Bot):
         self.db_conn.commit()
     
     async def execute_rcon_command(self, server: ServerConfig, command: str) -> Optional[str]:
-        """Execute RCON command on a server"""
+        """Execute RCON command on a server using WebRCON"""
         try:
-            from rcon.source import Client
-            import asyncio
+            import aiohttp
+            import json
             
-            # Run in executor to avoid blocking with timeout
-            loop = asyncio.get_event_loop()
+            # WebRCON uses HTTP
+            url = f"http://{server.ip}:{server.rcon_port}/{server.rcon_password}/"
             
-            def run_command():
+            # Prepare the command
+            payload = {
+                "Identifier": 1,
+                "Message": command,
+                "Name": "WipeBot"
+            }
+            
+            async with aiohttp.ClientSession() as session:
                 try:
-                    # Add timeout to connection
-                    with Client(server.ip, server.rcon_port, passwd=server.rcon_password, timeout=5) as client:
-                        response = client.run(command)
-                        return response
-                except Exception as e:
-                    logger.error(f"RCON connection error: {e}")
-                    raise e
-            
-            # Add timeout to the entire operation
-            try:
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(None, run_command),
-                    timeout=10.0
-                )
-                logger.info(f"RCON command successful for {server.name}: {command}")
-                return response
-            except asyncio.TimeoutError:
-                logger.error(f"RCON timeout for {server.name}")
-                return None
-                
+                    async with session.ws_connect(url, timeout=5) as ws:
+                        await ws.send_str(json.dumps(payload))
+                        
+                        # Wait for response
+                        msg = await ws.receive(timeout=5)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            logger.info(f"RCON command successful for {server.name}: {command}")
+                            return data.get("Message", "Success")
+                        else:
+                            logger.error(f"Unexpected WebSocket message type: {msg.type}")
+                            return None
+                            
+                except asyncio.TimeoutError:
+                    logger.error(f"WebRCON timeout for {server.name}")
+                    # Try alternative method - Rust+ companion
+                    return await self.try_http_rcon(server, command)
+                    
         except Exception as e:
-            logger.error(f"RCON error for {server.name}: {e}")
+            logger.error(f"WebRCON error for {server.name}: {e}")
+            # Fallback to HTTP POST method
+            return await self.try_http_rcon(server, command)
+    
+    async def try_http_rcon(self, server: ServerConfig, command: str) -> Optional[str]:
+        """Alternative RCON method using HTTP POST"""
+        try:
+            import aiohttp
+            
+            # Some Rust servers respond to simple HTTP POST
+            url = f"http://{server.ip}:{server.rcon_port}/rcon/{server.rcon_password}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=command, timeout=5) as response:
+                    if response.status == 200:
+                        result = await response.text()
+                        logger.info(f"HTTP RCON successful for {server.name}")
+                        return result
+                    else:
+                        logger.error(f"HTTP RCON failed with status {response.status}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"HTTP RCON error: {e}")
             return None
     
     async def set_wipe_type(self, server_name: str, wipe_type: str, user: discord.User) -> bool:
