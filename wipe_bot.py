@@ -325,63 +325,64 @@ class WipeCommands(commands.Cog):
             for server in servers if current.lower() in server.lower()
         ][:25]
     
-    @app_commands.command(name='setwipe', description='Set the wipe type for a server')
-    @app_commands.autocomplete(server=server_autocomplete)
-    async def set_wipe(self, interaction: discord.Interaction, server: Optional[str] = None):
-        """Set wipe type for a server"""
-        server_name = server
-        
-        if not server_name and len(self.bot.servers) == 1:
-            server_name = list(self.bot.servers.keys())[0]
-        elif not server_name:
-            # Show server selection
-            view = ServerSelectView(list(self.bot.servers.keys()))
-            embed = discord.Embed(
-                title="Select Server",
-                description="Choose which server to configure:",
-                color=discord.Color.blue()
-            )
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            
-            await view.wait()
-            if view.selected_server:
-                server_name = view.selected_server
-            else:
-                await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
-                return
-        else:
-            # Initial response for when server is provided
-            await interaction.response.defer(ephemeral=True)
-        
-        if not self.has_server_permission(interaction.user, server_name):
-            if interaction.response.is_done():
-                await interaction.edit_original_response(content="❌ You don't have permission to manage this server.")
-            else:
-                await interaction.response.send_message("❌ You don't have permission to manage this server.", ephemeral=True)
-            return
-        
-        # Show wipe type selection
-        view = WipeSelectView(server_name)
+@app_commands.command(name='setwipe', description='Set the wipe type for a server')
+@app_commands.autocomplete(server=server_autocomplete)
+async def set_wipe(self, interaction: discord.Interaction, server: Optional[str] = None):
+    """Set wipe type for a server"""
+    server_name = server
+    
+    if not server_name and len(self.bot.servers) == 1:
+        server_name = list(self.bot.servers.keys())[0]
+    elif not server_name:
+        # Show server selection
+        view = ServerSelectView(list(self.bot.servers.keys()))
         embed = discord.Embed(
-            title=f"Set Wipe Type - {server_name}",
-            description="Select the type of wipe for the next server restart:",
-            color=discord.Color.green()
+            title="Select Server",
+            description="Choose which server to configure:",
+            color=discord.Color.blue()
         )
-        embed.add_field(
-            name="Options",
-            value="🗺️ **Map Only** - Reset map, keep blueprints\n"
-                  "📋 **Blueprint Only** - Reset blueprints, keep map\n"
-                  "💥 **Full Wipe** - Reset both map and blueprints",
-            inline=False
-        )
-        
-        if interaction.response.is_done():
-            await interaction.edit_original_response(embed=embed, view=view)
-        else:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
         await view.wait()
-        
+        if view.selected_server:
+            server_name = view.selected_server
+        else:
+            await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
+            return
+    else:
+        # Initial response for when server is provided
+        await interaction.response.defer(ephemeral=True)
+    
+    if not self.has_server_permission(interaction.user, server_name):
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content="❌ You don't have permission to manage this server.")
+        else:
+            await interaction.response.send_message("❌ You don't have permission to manage this server.", ephemeral=True)
+        return
+    
+    # Show wipe type selection
+    view = WipeSelectView(server_name)
+    embed = discord.Embed(
+        title=f"Set Wipe Type - {server_name}",
+        description="Select the type of wipe for the next server restart:",
+        color=discord.Color.green()
+    )
+    embed.add_field(
+        name="Options",
+        value="🗺️ **Map Only** - Reset map, keep blueprints\n"
+              "📋 **Blueprint Only** - Reset blueprints, keep map\n"
+              "💥 **Full Wipe** - Reset both map and blueprints",
+        inline=False
+    )
+    
+    if interaction.response.is_done():
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    await view.wait()
+    
+    # THIS PART NEEDS TO BE INDENTED - IT'S PART OF THE set_wipe METHOD
     if view.selected_type:
         # Show loading message
         loading_embed = discord.Embed(
