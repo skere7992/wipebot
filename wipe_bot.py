@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 import asyncio
 import aiofiles
 import json
@@ -125,6 +126,20 @@ class WipeAnnouncerBot(commands.Bot):
         await self.load_config()
         self.setup_database()
         self.check_wipe_status.start()
+        
+        # Add the cog and sync commands
+        await self.add_cog(WipeCommands(self))
+        
+        # Sync commands to the guild
+        if self.config.get('guild_id'):
+            guild = discord.Object(id=self.config['guild_id'])
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info(f"Synced commands to guild {self.config['guild_id']}")
+        else:
+            await self.tree.sync()
+            logger.info("Synced commands globally")
+        
         logger.info(f"Bot initialized with {len(self.servers)} servers")
     
     async def load_config(self):
@@ -286,9 +301,20 @@ class WipeCommands(commands.Cog):
                 return any(role.id == server.admin_role_id for role in user.roles)
         return False
     
-    @commands.command(name='setwipe')
-    async def set_wipe(self, ctx: commands.Context, server_name: Optional[str] = None):
+    async def server_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        """Autocomplete for server names"""
+        servers = list(self.bot.servers.keys())
+        return [
+            app_commands.Choice(name=server, value=server)
+            for server in servers if current.lower() in server.lower()
+        ][:25]
+    
+    @app_commands.command(name='setwipe', description='Set the wipe type for a server')
+    @app_commands.autocomplete(server=server_autocomplete)
+    async def set_wipe(self, interaction: discord.Interaction, server: Optional[str] = None):
         """Set wipe type for a server"""
+        server_name = server
+        
         if not server_name and len(self.bot.servers) == 1:
             server_name = list(self.bot.servers.keys())[0]
         elif not server_name:
@@ -299,18 +325,23 @@ class WipeCommands(commands.Cog):
                 description="Choose which server to configure:",
                 color=discord.Color.blue()
             )
-            msg = await ctx.send(embed=embed, view=view)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
             
             await view.wait()
             if view.selected_server:
                 server_name = view.selected_server
-                await msg.delete()
             else:
-                await msg.edit(content="Selection cancelled.", embed=None, view=None)
+                await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
                 return
+        else:
+            # Initial response for when server is provided
+            await interaction.response.defer(ephemeral=True)
         
-        if not self.has_server_permission(ctx.author, server_name):
-            await ctx.send("❌ You don't have permission to manage this server.")
+        if not self.has_server_permission(interaction.user, server_name):
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content="❌ You don't have permission to manage this server.")
+            else:
+                await interaction.response.send_message("❌ You don't have permission to manage this server.", ephemeral=True)
             return
         
         # Show wipe type selection
@@ -328,36 +359,43 @@ class WipeCommands(commands.Cog):
             inline=False
         )
         
-        msg = await ctx.send(embed=embed, view=view)
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        
         await view.wait()
         
         if view.selected_type:
-            success = await self.bot.set_wipe_type(server_name, view.selected_type, ctx.author)
+            success = await self.bot.set_wipe_type(server_name, view.selected_type, interaction.user)
             if success:
                 embed = discord.Embed(
                     title="✅ Wipe Type Set",
                     description=f"**Server:** {server_name}\n"
                                f"**Type:** {WipeType.get_emoji(view.selected_type)} {WipeType.get_display_name(view.selected_type)}\n"
-                               f"**Set by:** {ctx.author.mention}",
+                               f"**Set by:** {interaction.user.mention}",
                     color=discord.Color.green(),
                     timestamp=datetime.datetime.utcnow()
                 )
-                await msg.edit(embed=embed, view=None)
+                await interaction.edit_original_response(embed=embed, view=None)
             else:
-                await msg.edit(content="❌ Failed to set wipe type. Check RCON connection.", embed=None, view=None)
+                await interaction.edit_original_response(content="❌ Failed to set wipe type. Check RCON connection.", embed=None, view=None)
         else:
-            await msg.edit(content="Selection cancelled.", embed=None, view=None)
+            await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
     
-    @commands.command(name='wipestatus')
-    async def wipe_status(self, ctx: commands.Context, server_name: Optional[str] = None):
+    @app_commands.command(name='wipestatus', description='Check wipe status for servers')
+    @app_commands.autocomplete(server=server_autocomplete)
+    async def wipe_status(self, interaction: discord.Interaction, server: Optional[str] = None):
         """Check wipe status for server(s)"""
+        await interaction.response.defer(ephemeral=True)
+        
         embed = discord.Embed(
             title="Server Wipe Status",
             color=discord.Color.blue(),
             timestamp=datetime.datetime.utcnow()
         )
         
-        servers_to_check = [server_name] if server_name else list(self.bot.servers.keys())
+        servers_to_check = [server] if server else list(self.bot.servers.keys())
         
         for srv_name in servers_to_check:
             if srv_name not in self.bot.servers:
@@ -390,26 +428,32 @@ class WipeCommands(commands.Cog):
             
             embed.add_field(name=srv_name, value=field_value, inline=False)
         
-        await ctx.send(embed=embed)
+        await interaction.edit_original_response(embed=embed)
     
-    @commands.command(name='forcewipe')
-    @commands.has_permissions(administrator=True)
-    async def force_wipe(self, ctx: commands.Context, server_name: str):
+    @app_commands.command(name='forcewipe', description='Force wipe announcement immediately (Admin only)')
+    @app_commands.autocomplete(server=server_autocomplete)
+    async def force_wipe(self, interaction: discord.Interaction, server: str):
         """Force wipe announcement immediately"""
-        if server_name not in self.bot.servers:
-            await ctx.send("❌ Server not found.")
+        if not self.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
             return
         
-        server = self.bot.servers[server_name]
-        response = await self.bot.execute_rcon_command(server, "wipeannouncer.force")
+        await interaction.response.defer(ephemeral=True)
+        
+        if server not in self.bot.servers:
+            await interaction.edit_original_response(content="❌ Server not found.")
+            return
+        
+        server_config = self.bot.servers[server]
+        response = await self.bot.execute_rcon_command(server_config, "wipeannouncer.force")
         
         if response:
             embed = discord.Embed(
                 title="✅ Forced Wipe Announcement",
-                description=f"**Server:** {server_name}\n**Response:** {response}",
+                description=f"**Server:** {server}\n**Response:** {response}",
                 color=discord.Color.green()
             )
-            await ctx.send(embed=embed)
+            await interaction.edit_original_response(embed=embed)
             
             # Update database
             cursor = self.bot.db_conn.cursor()
@@ -417,24 +461,27 @@ class WipeCommands(commands.Cog):
                 UPDATE wipe_settings 
                 SET last_announcement = ?, announcement_count = announcement_count + 1
                 WHERE server_name = ?
-            ''', (datetime.datetime.utcnow(), server_name))
+            ''', (datetime.datetime.utcnow(), server))
             self.bot.db_conn.commit()
         else:
-            await ctx.send("❌ Failed to force announcement.")
+            await interaction.edit_original_response(content="❌ Failed to force announcement.")
     
-    @commands.command(name='wipehistory')
-    async def wipe_history(self, ctx: commands.Context, server_name: Optional[str] = None):
+    @app_commands.command(name='wipehistory', description='Show wipe configuration history')
+    @app_commands.autocomplete(server=server_autocomplete)
+    async def wipe_history(self, interaction: discord.Interaction, server: Optional[str] = None):
         """Show wipe configuration history"""
+        await interaction.response.defer(ephemeral=True)
+        
         cursor = self.bot.db_conn.cursor()
         
-        if server_name:
+        if server:
             cursor.execute('''
                 SELECT server_name, wipe_type, set_by_username, executed_at 
                 FROM wipe_history 
                 WHERE server_name = ? 
                 ORDER BY executed_at DESC 
                 LIMIT 10
-            ''', (server_name,))
+            ''', (server,))
         else:
             cursor.execute('''
                 SELECT server_name, wipe_type, set_by_username, executed_at 
@@ -446,7 +493,7 @@ class WipeCommands(commands.Cog):
         rows = cursor.fetchall()
         
         if not rows:
-            await ctx.send("No wipe history found.")
+            await interaction.edit_original_response(content="No wipe history found.")
             return
         
         embed = discord.Embed(
@@ -454,84 +501,15 @@ class WipeCommands(commands.Cog):
             color=discord.Color.blue()
         )
         
-        for server, wipe_type, set_by, executed_at in rows:
+        for server_name, wipe_type, set_by, executed_at in rows:
             timestamp = int(datetime.datetime.fromisoformat(executed_at).timestamp())
             embed.add_field(
-                name=f"{server} - <t:{timestamp}:R>",
+                name=f"{server_name} - <t:{timestamp}:R>",
                 value=f"{WipeType.get_emoji(wipe_type)} {WipeType.get_display_name(wipe_type)}\nSet by: {set_by}",
                 inline=False
             )
         
-        await ctx.send(embed=embed)
-    
-    @commands.command(name='addserver')
-    @commands.has_permissions(administrator=True)
-    async def add_server(self, ctx: commands.Context):
-        """Add a new server (Admin only)"""
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-        
-        embed = discord.Embed(
-            title="Add New Server",
-            description="Please provide the following information:",
-            color=discord.Color.blue()
-        )
-        await ctx.send(embed=embed)
-        
-        try:
-            # Collect server information
-            await ctx.send("**Server name:**")
-            name_msg = await self.bot.wait_for('message', check=check, timeout=60)
-            name = name_msg.content
-            
-            await ctx.send("**Server IP:**")
-            ip_msg = await self.bot.wait_for('message', check=check, timeout=60)
-            ip = ip_msg.content
-            
-            await ctx.send("**RCON Port:**")
-            port_msg = await self.bot.wait_for('message', check=check, timeout=60)
-            rcon_port = int(port_msg.content)
-            
-            await ctx.send("**RCON Password:**")
-            pass_msg = await self.bot.wait_for('message', check=check, timeout=60)
-            rcon_password = pass_msg.content
-            await pass_msg.delete()  # Delete password message
-            
-            await ctx.send("**Discord Channel ID for notifications:**")
-            channel_msg = await self.bot.wait_for('message', check=check, timeout=60)
-            channel_id = int(channel_msg.content)
-            
-            # Create new server config
-            new_server = {
-                "name": name,
-                "ip": ip,
-                "rcon_port": rcon_port,
-                "rcon_password": rcon_password,
-                "discord_channel_id": channel_id
-            }
-            
-            # Add to config
-            self.bot.config['servers'].append(new_server)
-            
-            # Save config
-            async with aiofiles.open(CONFIG_FILE, 'w') as f:
-                await f.write(json.dumps(self.bot.config, indent=4))
-            
-            # Add to bot
-            server_config = ServerConfig(**new_server)
-            self.bot.servers[name] = server_config
-            
-            embed = discord.Embed(
-                title="✅ Server Added",
-                description=f"**{name}** has been added successfully!",
-                color=discord.Color.green()
-            )
-            await ctx.send(embed=embed)
-            
-        except asyncio.TimeoutError:
-            await ctx.send("❌ Setup timed out.")
-        except Exception as e:
-            await ctx.send(f"❌ Error: {e}")
+        await interaction.edit_original_response(embed=embed)
 
 async def main():
     bot = WipeAnnouncerBot()
@@ -546,20 +524,9 @@ async def main():
             )
         )
     
-    await bot.add_cog(WipeCommands(bot))
-    
     # Load token from config
     if not os.path.exists(CONFIG_FILE):
-        logger.error("Config file not found! Creating default...")
-        default_config = {
-            "bot_token": "YOUR_BOT_TOKEN_HERE",
-            "guild_id": 0,
-            "admin_user_ids": [],
-            "servers": []
-        }
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(default_config, f, indent=4)
-        logger.error("Please configure the bot in config.json")
+        logger.error("Config file not found!")
         return
     
     with open(CONFIG_FILE, 'r') as f:
