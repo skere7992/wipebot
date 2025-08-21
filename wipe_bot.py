@@ -194,15 +194,17 @@ class WipeAnnouncerBot(commands.Bot):
     async def execute_rcon_command(self, server: ServerConfig, command: str) -> Optional[str]:
         """Execute RCON command on a server"""
         try:
-            from aiorcon import RCON
+            from rcon.source import Client
+            import asyncio
             
-            rcon = await RCON.create(
-                host=server.ip,
-                port=server.rcon_port,
-                password=server.rcon_password
-            )
-            response = await rcon(command)
-            rcon.close()
+            # Run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            
+            def run_command():
+                with Client(server.ip, server.rcon_port, passwd=server.rcon_password) as client:
+                    return client.run(command)
+            
+            response = await loop.run_in_executor(None, run_command)
             return response
         except Exception as e:
             logger.error(f"RCON error for {server.name}: {e}")
