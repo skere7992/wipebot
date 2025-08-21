@@ -1,3 +1,3 @@
 discord.py==2.3.2
-aiorcon==1.3.1
-aiofiles==23.2.1
+aiorcon==0.6.8
+aiofiles==24.1.0
