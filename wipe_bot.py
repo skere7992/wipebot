@@ -194,10 +194,12 @@ class WipeAnnouncerBot(commands.Bot):
     async def execute_rcon_command(self, server: ServerConfig, command: str) -> Optional[str]:
         """Execute RCON command on a server"""
         try:
-            client = aiorcon.Client(server.ip, server.rcon_port, server.rcon_password)
-            await client.connect()
-            response = await client.send(command)
-            await client.close()
+            from aiorcon import RCON
+            
+            rcon = RCON(server.ip, server.rcon_port, server.rcon_password)
+            await rcon.connect()
+            response = await rcon(command)
+            rcon.close()
             return response
         except Exception as e:
             logger.error(f"RCON error for {server.name}: {e}")
