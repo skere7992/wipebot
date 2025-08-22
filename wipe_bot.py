@@ -10,6 +10,7 @@ from typing import Optional, Dict, List
 import logging
 from dataclasses import dataclass, asdict
 import os
+import websocket
 
 # Setup logging
 logging.basicConfig(
@@ -31,6 +32,7 @@ class ServerConfig:
     discord_channel_id: int
     admin_role_id: Optional[int] = None
     notification_role_id: Optional[int] = None
+    wipe_schedule: Optional[Dict] = None
 
 class WipeType:
     MAP = "map"
@@ -53,63 +55,165 @@ class WipeType:
             WipeType.FULL: "Full Wipe (Map + BP)"
         }.get(wipe_type, "Unknown")
 
-class WipeSelectView(discord.ui.View):
-    def __init__(self, server_name: str, timeout: float = 300):
-        super().__init__(timeout=timeout)
+class WipePollView(discord.ui.View):
+    def __init__(self, server_name: str, wipe_time: datetime.datetime, bot):
+        # Poll ends 1 hour before wipe
+        timeout_seconds = (wipe_time - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 3600
+        # Ensure timeout is positive and within Discord's limits
+        timeout_seconds = max(60, min(timeout_seconds, 86400))  # Between 1 minute and 24 hours
+        super().__init__(timeout=timeout_seconds)
         self.server_name = server_name
-        self.selected_type = None
-        self.interaction_user = None
+        self.wipe_time = wipe_time
+        self.bot = bot
+        self.votes = {"map": set(), "blueprint": set(), "full": set()}
+    
+    async def on_timeout(self):
+        """When poll ends, set the winning wipe type"""
+        try:
+            # Count votes
+            vote_counts = {
+                "map": len(self.votes["map"]),
+                "blueprint": len(self.votes["blueprint"]),
+                "full": len(self.votes["full"])
+            }
+            
+            # Get winner (default to full wipe if no votes)
+            if sum(vote_counts.values()) == 0:
+                winner = "full"
+            else:
+                winner = max(vote_counts, key=vote_counts.get)
+            
+            # Create a mock user for the system
+            class SystemUser:
+                id = 0
+                name = "Auto Poll System"
+                def __str__(self):
+                    return self.name
+            
+            # Set wipe type
+            success = await self.bot.set_wipe_type(self.server_name, winner, SystemUser())
+            
+            # Update poll message to show results
+            cursor = self.bot.db_conn.cursor()
+            cursor.execute('''
+                SELECT channel_id, message_id FROM wipe_polls 
+                WHERE server_name = ? AND poll_active = 1
+            ''', (self.server_name,))
+            
+            row = cursor.fetchone()
+            if row:
+                channel = self.bot.get_channel(row[0])
+                if channel:
+                    try:
+                        message = await channel.fetch_message(row[1])
+                        embed = discord.Embed(
+                            title=f"✅ Poll Ended - {self.server_name}",
+                            description=f"**Winner:** {WipeType.get_emoji(winner)} {WipeType.get_display_name(winner)}\n\n"
+                                       f"Final votes:\n"
+                                       f"🗺️ Map Only: {vote_counts['map']}\n"
+                                       f"📋 Blueprint Only: {vote_counts['blueprint']}\n"
+                                       f"💥 Full Wipe: {vote_counts['full']}\n\n"
+                                       f"{'✅ Wipe type has been set!' if success else '⚠️ Failed to set wipe type - manual setting required'}",
+                            color=discord.Color.green() if success else discord.Color.orange()
+                        )
+                        await message.edit(embed=embed, view=None)
+                    except Exception as e:
+                        logger.error(f"Failed to update poll message: {e}")
+            
+            # Mark poll as inactive
+            cursor.execute('''
+                UPDATE wipe_polls SET poll_active = 0, winner = ?
+                WHERE server_name = ?
+            ''', (winner, self.server_name))
+            self.bot.db_conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Error in poll timeout: {e}")
+    
+    async def update_poll_message(self, interaction: discord.Interaction):
+        """Update the poll embed with current votes"""
+        embed = discord.Embed(
+            title=f"🗳️ Wipe Type Vote - {self.server_name}",
+            description=f"**Next wipe:** <t:{int(self.wipe_time.timestamp())}:F>\n\n"
+                       f"Vote for the wipe type below!\n"
+                       f"Poll ends 1 hour before wipe.\n\n"
+                       f"**Current votes:**\n"
+                       f"🗺️ Map Only: **{len(self.votes['map'])}** votes\n"
+                       f"📋 Blueprint Only: **{len(self.votes['blueprint'])}** votes\n"
+                       f"💥 Full Wipe: **{len(self.votes['full'])}** votes\n\n"
+                       f"*You voted for: {self.get_user_vote(interaction.user.id)}*",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        embed.set_footer(text="Click a button to vote or change your vote")
+        await interaction.edit_original_response(embed=embed)
+    
+    def get_user_vote(self, user_id: int) -> str:
+        """Get what the user voted for"""
+        if user_id in self.votes["map"]:
+            return "🗺️ Map Only"
+        elif user_id in self.votes["blueprint"]:
+            return "📋 Blueprint Only"
+        elif user_id in self.votes["full"]:
+            return "💥 Full Wipe"
+        return "Nothing yet"
     
     @discord.ui.button(label="Map Only", emoji="🗺️", style=discord.ButtonStyle.primary)
-    async def map_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.selected_type = WipeType.MAP
-        self.interaction_user = interaction.user
+    async def map_vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user has permission to vote
+        member = interaction.user
+        server = self.bot.servers.get(self.server_name)
+        if server and server.admin_role_id:
+            if not any(role.id == server.admin_role_id for role in member.roles):
+                await interaction.response.send_message("❌ You don't have permission to vote.", ephemeral=True)
+                return
+        
+        # Remove user from other votes
+        user_id = interaction.user.id
+        self.votes["blueprint"].discard(user_id)
+        self.votes["full"].discard(user_id)
+        
+        # Add to this vote
+        self.votes["map"].add(user_id)
+        
         await interaction.response.defer()
-        self.stop()
+        await self.update_poll_message(interaction)
     
     @discord.ui.button(label="Blueprint Only", emoji="📋", style=discord.ButtonStyle.primary)
-    async def blueprint_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.selected_type = WipeType.BLUEPRINT
-        self.interaction_user = interaction.user
+    async def bp_vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user has permission to vote
+        member = interaction.user
+        server = self.bot.servers.get(self.server_name)
+        if server and server.admin_role_id:
+            if not any(role.id == server.admin_role_id for role in member.roles):
+                await interaction.response.send_message("❌ You don't have permission to vote.", ephemeral=True)
+                return
+        
+        user_id = interaction.user.id
+        self.votes["map"].discard(user_id)
+        self.votes["full"].discard(user_id)
+        self.votes["blueprint"].add(user_id)
+        
         await interaction.response.defer()
-        self.stop()
+        await self.update_poll_message(interaction)
     
     @discord.ui.button(label="Full Wipe", emoji="💥", style=discord.ButtonStyle.danger)
-    async def full_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.selected_type = WipeType.FULL
-        self.interaction_user = interaction.user
+    async def full_vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user has permission to vote
+        member = interaction.user
+        server = self.bot.servers.get(self.server_name)
+        if server and server.admin_role_id:
+            if not any(role.id == server.admin_role_id for role in member.roles):
+                await interaction.response.send_message("❌ You don't have permission to vote.", ephemeral=True)
+                return
+        
+        user_id = interaction.user.id
+        self.votes["map"].discard(user_id)
+        self.votes["blueprint"].discard(user_id)
+        self.votes["full"].add(user_id)
+        
         await interaction.response.defer()
-        self.stop()
-    
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.interaction_user = interaction.user
-        await interaction.response.defer()
-        self.stop()
-
-class ServerSelectView(discord.ui.View):
-    def __init__(self, servers: List[str], timeout: float = 60):
-        super().__init__(timeout=timeout)
-        self.selected_server = None
-        self.add_item(ServerSelectDropdown(servers))
-
-class ServerSelectDropdown(discord.ui.Select):
-    def __init__(self, servers: List[str]):
-        options = [
-            discord.SelectOption(label=server, value=server)
-            for server in servers[:25]  # Discord limit
-        ]
-        super().__init__(
-            placeholder="Select a server...",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-    
-    async def callback(self, interaction: discord.Interaction):
-        self.view.selected_server = self.values[0]
-        await interaction.response.defer()
-        self.view.stop()
+        await self.update_poll_message(interaction)
 
 class WipeAnnouncerBot(commands.Bot):
     def __init__(self):
@@ -125,7 +229,7 @@ class WipeAnnouncerBot(commands.Bot):
     async def setup_hook(self):
         await self.load_config()
         self.setup_database()
-        self.check_wipe_status.start()
+        self.check_upcoming_wipes.start()
         
         # Add the cog and sync commands
         await self.add_cog(WipeCommands(self))
@@ -149,6 +253,7 @@ class WipeAnnouncerBot(commands.Bot):
                 "bot_token": "YOUR_BOT_TOKEN_HERE",
                 "guild_id": 0,
                 "admin_user_ids": [],
+                "poll_hours_before_wipe": 24,
                 "servers": [
                     {
                         "name": "Server1",
@@ -157,7 +262,12 @@ class WipeAnnouncerBot(commands.Bot):
                         "rcon_password": "your_rcon_password",
                         "discord_channel_id": 0,
                         "admin_role_id": 0,
-                        "notification_role_id": 0
+                        "notification_role_id": 0,
+                        "wipe_schedule": {
+                            "day_of_week": 3,
+                            "hour": 14,
+                            "minute": 0
+                        }
                     }
                 ]
             }
@@ -180,14 +290,16 @@ class WipeAnnouncerBot(commands.Bot):
         cursor = self.db_conn.cursor()
         
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS wipe_settings (
+            CREATE TABLE IF NOT EXISTS wipe_polls (
                 server_name TEXT PRIMARY KEY,
-                wipe_type TEXT NOT NULL,
-                set_by_user_id INTEGER,
-                set_by_username TEXT,
-                set_at TIMESTAMP,
-                last_announcement TIMESTAMP,
-                announcement_count INTEGER DEFAULT 0
+                message_id INTEGER,
+                channel_id INTEGER,
+                wipe_time TIMESTAMP,
+                poll_active BOOLEAN,
+                votes_map INTEGER DEFAULT 0,
+                votes_bp INTEGER DEFAULT 0,
+                votes_full INTEGER DEFAULT 0,
+                winner TEXT
             )
         ''')
         
@@ -196,8 +308,7 @@ class WipeAnnouncerBot(commands.Bot):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_name TEXT NOT NULL,
                 wipe_type TEXT NOT NULL,
-                set_by_user_id INTEGER,
-                set_by_username TEXT,
+                set_by TEXT,
                 executed_at TIMESTAMP,
                 success BOOLEAN
             )
@@ -208,7 +319,6 @@ class WipeAnnouncerBot(commands.Bot):
     async def execute_rcon_command(self, server: ServerConfig, command: str) -> Optional[str]:
         """Execute RCON command using WebRCON (WebSocket)"""
         try:
-            import websocket
             import json
             import asyncio
             
@@ -251,7 +361,7 @@ class WipeAnnouncerBot(commands.Bot):
             logger.warning(f"WebRCON error for {server.name}: {e} - assuming success")
             return "Command executed"
     
-    async def set_wipe_type(self, server_name: str, wipe_type: str, user: discord.User) -> bool:
+    async def set_wipe_type(self, server_name: str, wipe_type: str, user) -> bool:
         """Set wipe type for a server and save to database"""
         if server_name not in self.servers:
             return False
@@ -263,279 +373,197 @@ class WipeAnnouncerBot(commands.Bot):
         if response:
             cursor = self.db_conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO wipe_settings 
-                (server_name, wipe_type, set_by_user_id, set_by_username, set_at, announcement_count)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT announcement_count FROM wipe_settings WHERE server_name = ?), 0))
-            ''', (server_name, wipe_type, user.id, str(user), datetime.datetime.utcnow(), server_name))
-            
-            cursor.execute('''
                 INSERT INTO wipe_history 
-                (server_name, wipe_type, set_by_user_id, set_by_username, executed_at, success)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (server_name, wipe_type, user.id, str(user), datetime.datetime.utcnow(), True))
+                (server_name, wipe_type, set_by, executed_at, success)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (server_name, wipe_type, str(user), datetime.datetime.now(datetime.timezone.utc), True))
             
             self.db_conn.commit()
             logger.info(f"Set wipe type for {server_name} to {wipe_type} by {user}")
             return True
         return False
     
-    async def get_server_status(self, server_name: str) -> Optional[Dict]:
-        """Get current status from server"""
+    def calculate_next_wipe(self, server_name: str) -> Optional[datetime.datetime]:
+        """Calculate next wipe time based on server schedule"""
         if server_name not in self.servers:
             return None
         
         server = self.servers[server_name]
-        response = await self.execute_rcon_command(server, "wipeannouncer.status")
         
-        if response:
-            # Parse the response
-            status = {}
-            for line in response.split('\n'):
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    status[key.strip().replace('-', '').strip()] = value.strip()
-            return status
-        return None
+        if not server.wipe_schedule:
+            return None
+        
+        wipe_schedule = server.wipe_schedule
+        
+        now = datetime.datetime.now(datetime.timezone.utc)
+        days_ahead = wipe_schedule['day_of_week'] - now.weekday()
+        
+        if days_ahead < 0:  # Target day already happened this week
+            days_ahead += 7
+        elif days_ahead == 0:  # Today
+            # Check if wipe time has passed
+            wipe_time_today = now.replace(
+                hour=wipe_schedule['hour'],
+                minute=wipe_schedule['minute'],
+                second=0,
+                microsecond=0
+            )
+            if now >= wipe_time_today:
+                days_ahead = 7  # Next week
+        
+        next_wipe = now + datetime.timedelta(days=days_ahead)
+        next_wipe = next_wipe.replace(
+            hour=wipe_schedule['hour'],
+            minute=wipe_schedule['minute'],
+            second=0,
+            microsecond=0
+        )
+        
+        return next_wipe
     
-    @tasks.loop(minutes=5)
-    async def check_wipe_status(self):
-        """Periodically check server status"""
+    async def send_wipe_poll(self, server_name: str, wipe_time: datetime.datetime):
+        """Send wipe type poll to Discord"""
+        server = self.servers[server_name]
+        
+        # Get the poll channel
+        channel = self.get_channel(server.discord_channel_id)
+        if not channel:
+            logger.error(f"Could not find channel {server.discord_channel_id} for {server_name}")
+            return
+        
+        # Create poll embed
+        embed = discord.Embed(
+            title=f"🗳️ Wipe Type Vote - {server_name}",
+            description=f"**Next wipe:** <t:{int(wipe_time.timestamp())}:F>\n\n"
+                       f"Vote for the wipe type below!\n"
+                       f"Poll ends 1 hour before wipe.\n\n"
+                       f"**Current votes:**\n"
+                       f"🗺️ Map Only: **0** votes\n"
+                       f"📋 Blueprint Only: **0** votes\n"
+                       f"💥 Full Wipe: **0** votes",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        embed.set_footer(text="Click a button to vote!")
+        
+        # Create view with buttons
+        view = WipePollView(server_name, wipe_time, self)
+        
+        # Send poll message
+        content = ""
+        if server.admin_role_id:
+            content = f"<@&{server.admin_role_id}> - Wipe vote is now open!"
+        
+        message = await channel.send(
+            content=content,
+            embed=embed,
+            view=view
+        )
+        
+        # Store poll in database
+        cursor = self.db_conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO wipe_polls 
+            (server_name, message_id, channel_id, wipe_time, poll_active)
+            VALUES (?, ?, ?, ?, 1)
+        ''', (server_name, message.id, channel.id, wipe_time.isoformat()))
+        self.db_conn.commit()
+        
+        logger.info(f"Sent wipe poll for {server_name} - wipe at {wipe_time}")
+    
+    @tasks.loop(minutes=30)  # Check every 30 minutes
+    async def check_upcoming_wipes(self):
+        """Check for upcoming wipes and send polls"""
         for server_name, server in self.servers.items():
-            status = await self.get_server_status(server_name)
-            if status:
-                logger.debug(f"Status for {server_name}: {status}")
+            try:
+                # Check if we already have an active poll
+                cursor = self.db_conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM wipe_polls 
+                    WHERE server_name = ? AND poll_active = 1
+                ''', (server_name,))
+                
+                if cursor.fetchone():
+                    continue  # Already has active poll
+                
+                # Get next wipe time
+                next_wipe = self.calculate_next_wipe(server_name)
+                
+                if next_wipe:
+                    time_until_wipe = next_wipe - datetime.datetime.now(datetime.timezone.utc)
+                    hours_before = self.config.get('poll_hours_before_wipe', 24)
+                    
+                    # If wipe is between X and X+0.5 hours away, send poll
+                    if datetime.timedelta(hours=hours_before-0.5) <= time_until_wipe <= datetime.timedelta(hours=hours_before):
+                        await self.send_wipe_poll(server_name, next_wipe)
+                        
+            except Exception as e:
+                logger.error(f"Error checking wipes for {server_name}: {e}")
     
-    @check_wipe_status.before_loop
-    async def before_check_status(self):
+    @check_upcoming_wipes.before_loop
+    async def before_check_wipes(self):
         await self.wait_until_ready()
 
 class WipeCommands(commands.Cog):
     def __init__(self, bot: WipeAnnouncerBot):
         self.bot = bot
     
-    def is_admin(self, user: discord.User) -> bool:
-        """Check if user is admin"""
-        return user.id in self.bot.config.get('admin_user_ids', [])
-    
-    def has_server_permission(self, user: discord.Member, server_name: str) -> bool:
-        """Check if user has permission for a specific server"""
-        if self.is_admin(user):
-            return True
-        
-        if server_name in self.bot.servers:
-            server = self.bot.servers[server_name]
-            if server.admin_role_id:
-                return any(role.id == server.admin_role_id for role in user.roles)
-        return False
-    
-    async def server_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        """Autocomplete for server names"""
-        servers = list(self.bot.servers.keys())
-        return [
-            app_commands.Choice(name=server, value=server)
-            for server in servers if current.lower() in server.lower()
-        ][:25]
-    
-    @app_commands.command(name='setwipe', description='Set the wipe type for a server')
-    @app_commands.autocomplete(server=server_autocomplete)
-    async def set_wipe(self, interaction: discord.Interaction, server: Optional[str] = None):
-        """Set wipe type for a server"""
-        server_name = server
-        
-        if not server_name and len(self.bot.servers) == 1:
-            server_name = list(self.bot.servers.keys())[0]
-        elif not server_name:
-            # Show server selection
-            view = ServerSelectView(list(self.bot.servers.keys()))
-            embed = discord.Embed(
-                title="Select Server",
-                description="Choose which server to configure:",
-                color=discord.Color.blue()
-            )
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            
-            await view.wait()
-            if view.selected_server:
-                server_name = view.selected_server
-            else:
-                await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
-                return
-        else:
-            # Initial response for when server is provided
-            await interaction.response.defer(ephemeral=True)
-        
-        if not self.has_server_permission(interaction.user, server_name):
-            if interaction.response.is_done():
-                await interaction.edit_original_response(content="❌ You don't have permission to manage this server.")
-            else:
-                await interaction.response.send_message("❌ You don't have permission to manage this server.", ephemeral=True)
-            return
-        
-        # Show wipe type selection
-        view = WipeSelectView(server_name)
-        embed = discord.Embed(
-            title=f"Set Wipe Type - {server_name}",
-            description="Select the type of wipe for the next server restart:",
-            color=discord.Color.green()
-        )
-        embed.add_field(
-            name="Options",
-            value="🗺️ **Map Only** - Reset map, keep blueprints\n"
-                  "📋 **Blueprint Only** - Reset blueprints, keep map\n"
-                  "💥 **Full Wipe** - Reset both map and blueprints",
-            inline=False
-        )
-        
-        if interaction.response.is_done():
-            await interaction.edit_original_response(embed=embed, view=view)
-        else:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        
-        await view.wait()
-        
-        if view.selected_type:
-            # Show loading message
-            loading_embed = discord.Embed(
-                title="⏳ Setting Wipe Type",
-                description=f"Connecting to {server_name}...",
-                color=discord.Color.yellow()
-            )
-            await interaction.edit_original_response(embed=loading_embed, view=None)
-            
-            success = await self.bot.set_wipe_type(server_name, view.selected_type, interaction.user)
-            
-            if success:
-                embed = discord.Embed(
-                    title="✅ Wipe Type Set",
-                    description=f"**Server:** {server_name}\n"
-                               f"**Type:** {WipeType.get_emoji(view.selected_type)} {WipeType.get_display_name(view.selected_type)}\n"
-                               f"**Set by:** {interaction.user.mention}",
-                    color=discord.Color.green(),
-                    timestamp=datetime.datetime.utcnow()
-                )
-                await interaction.edit_original_response(embed=embed)
-            else:
-                error_embed = discord.Embed(
-                    title="❌ Failed to Set Wipe Type",
-                    description=f"Could not connect to **{server_name}**\n\n"
-                               f"**Possible issues:**\n"
-                               f"• Wrong RCON password\n"
-                               f"• Wrong IP or port\n"
-                               f"• Server is offline\n"
-                               f"• RCON is disabled on the server\n\n"
-                               f"Check your `config.json` settings.",
-                    color=discord.Color.red()
-                )
-                await interaction.edit_original_response(embed=error_embed)
-        else:
-            await interaction.edit_original_response(content="Selection cancelled.", embed=None, view=None)
-    
-    @app_commands.command(name='wipestatus', description='Check wipe status for servers')
-    @app_commands.autocomplete(server=server_autocomplete)
-    async def wipe_status(self, interaction: discord.Interaction, server: Optional[str] = None):
-        """Check wipe status for server(s)"""
+    @app_commands.command(name='wipestatus', description='Check upcoming wipe and poll status')
+    async def wipe_status(self, interaction: discord.Interaction):
+        """Check wipe status for servers"""
         await interaction.response.defer(ephemeral=True)
         
         embed = discord.Embed(
-            title="Server Wipe Status",
+            title="📅 Wipe Schedule Status",
             color=discord.Color.blue(),
-            timestamp=datetime.datetime.utcnow()
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
         
-        servers_to_check = [server] if server else list(self.bot.servers.keys())
-        
-        for srv_name in servers_to_check:
-            if srv_name not in self.bot.servers:
-                continue
+        for server_name in self.bot.servers.keys():
+            # Get next wipe time
+            next_wipe = self.bot.calculate_next_wipe(server_name)
             
-            # Get from database
+            # Check for active poll
             cursor = self.bot.db_conn.cursor()
             cursor.execute('''
-                SELECT wipe_type, set_by_username, set_at 
-                FROM wipe_settings 
+                SELECT poll_active, winner FROM wipe_polls 
                 WHERE server_name = ?
-            ''', (srv_name,))
-            row = cursor.fetchone()
-            
-            # Get live status
-            status = await self.bot.get_server_status(srv_name)
+                ORDER BY wipe_time DESC LIMIT 1
+            ''', (server_name,))
+            poll_row = cursor.fetchone()
             
             field_value = ""
-            if row:
-                wipe_type, set_by, set_at = row
-                field_value += f"**Configured:** {WipeType.get_emoji(wipe_type)} {WipeType.get_display_name(wipe_type)}\n"
-                field_value += f"**Set by:** {set_by}\n"
-                field_value += f"**Set at:** <t:{int(datetime.datetime.fromisoformat(set_at).timestamp())}:R>\n"
+            if next_wipe:
+                field_value += f"**Next wipe:** <t:{int(next_wipe.timestamp())}:F>\n"
+                time_until = next_wipe - datetime.datetime.now(datetime.timezone.utc)
+                field_value += f"**Time until:** {int(time_until.total_seconds() / 3600)} hours\n"
+            else:
+                field_value += "**Next wipe:** Not scheduled\n"
             
-            if status and 'Next Wipe Type' in status:
-                field_value += f"**Current in-game:** {status.get('Next Wipe Type', 'Unknown')}"
+            if poll_row:
+                if poll_row[0]:  # poll_active
+                    field_value += "**Poll:** 🟢 Active - voting open\n"
+                elif poll_row[1]:  # winner
+                    field_value += f"**Last poll winner:** {WipeType.get_emoji(poll_row[1])} {WipeType.get_display_name(poll_row[1])}\n"
+            else:
+                field_value += "**Poll:** Waiting for next cycle\n"
             
-            if not field_value:
-                field_value = "No wipe type configured"
-            
-            embed.add_field(name=srv_name, value=field_value, inline=False)
+            embed.add_field(name=f"🖥️ {server_name}", value=field_value, inline=False)
         
         await interaction.edit_original_response(embed=embed)
     
-    @app_commands.command(name='forcewipe', description='Force wipe announcement immediately (Admin only)')
-    @app_commands.autocomplete(server=server_autocomplete)
-    async def force_wipe(self, interaction: discord.Interaction, server: str):
-        """Force wipe announcement immediately"""
-        if not self.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-        
-        await interaction.response.defer(ephemeral=True)
-        
-        if server not in self.bot.servers:
-            await interaction.edit_original_response(content="❌ Server not found.")
-            return
-        
-        server_config = self.bot.servers[server]
-        response = await self.bot.execute_rcon_command(server_config, "wipeannouncer.force")
-        
-        if response:
-            embed = discord.Embed(
-                title="✅ Forced Wipe Announcement",
-                description=f"**Server:** {server}\n**Response:** {response}",
-                color=discord.Color.green()
-            )
-            await interaction.edit_original_response(embed=embed)
-            
-            # Update database
-            cursor = self.bot.db_conn.cursor()
-            cursor.execute('''
-                UPDATE wipe_settings 
-                SET last_announcement = ?, announcement_count = announcement_count + 1
-                WHERE server_name = ?
-            ''', (datetime.datetime.utcnow(), server))
-            self.bot.db_conn.commit()
-        else:
-            await interaction.edit_original_response(content="❌ Failed to force announcement.")
-    
-    @app_commands.command(name='wipehistory', description='Show wipe configuration history')
-    @app_commands.autocomplete(server=server_autocomplete)
-    async def wipe_history(self, interaction: discord.Interaction, server: Optional[str] = None):
-        """Show wipe configuration history"""
+    @app_commands.command(name='wipehistory', description='Show wipe poll history')
+    async def wipe_history(self, interaction: discord.Interaction):
+        """Show wipe history"""
         await interaction.response.defer(ephemeral=True)
         
         cursor = self.bot.db_conn.cursor()
-        
-        if server:
-            cursor.execute('''
-                SELECT server_name, wipe_type, set_by_username, executed_at 
-                FROM wipe_history 
-                WHERE server_name = ? 
-                ORDER BY executed_at DESC 
-                LIMIT 10
-            ''', (server,))
-        else:
-            cursor.execute('''
-                SELECT server_name, wipe_type, set_by_username, executed_at 
-                FROM wipe_history 
-                ORDER BY executed_at DESC 
-                LIMIT 10
-            ''')
+        cursor.execute('''
+            SELECT server_name, wipe_type, set_by, executed_at 
+            FROM wipe_history 
+            ORDER BY executed_at DESC 
+            LIMIT 10
+        ''')
         
         rows = cursor.fetchall()
         
@@ -544,7 +572,8 @@ class WipeCommands(commands.Cog):
             return
         
         embed = discord.Embed(
-            title="Wipe Configuration History",
+            title="📜 Wipe History",
+            description="Last 10 wipe configurations",
             color=discord.Color.blue()
         )
         
@@ -567,7 +596,7 @@ async def main():
         await bot.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="Server Wipes"
+                name="Wipe Polls"
             )
         )
     
