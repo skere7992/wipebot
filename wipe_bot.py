@@ -394,32 +394,65 @@ class WipeAnnouncerBot(commands.Bot):
             return None
         
         wipe_schedule = server.wipe_schedule
+        schedule_type = wipe_schedule.get('type', 'weekly')
         
         now = datetime.datetime.now(datetime.timezone.utc)
-        days_ahead = wipe_schedule['day_of_week'] - now.weekday()
         
-        if days_ahead < 0:  # Target day already happened this week
-            days_ahead += 7
-        elif days_ahead == 0:  # Today
-            # Check if wipe time has passed
-            wipe_time_today = now.replace(
+        if schedule_type == 'monthly':
+            # First Thursday of the month
+            target_day = wipe_schedule['day_of_week']  # 3 for Thursday
+            
+            # Get first day of current month
+            first_day = now.replace(day=1, hour=wipe_schedule['hour'], 
+                                    minute=wipe_schedule['minute'], second=0, microsecond=0)
+            
+            # Find first Thursday
+            days_until_target = (target_day - first_day.weekday()) % 7
+            first_thursday = first_day + datetime.timedelta(days=days_until_target)
+            
+            # If we've passed it this month, get next month's
+            if now >= first_thursday:
+                # Next month
+                if now.month == 12:
+                    first_day = now.replace(year=now.year + 1, month=1, day=1,
+                                           hour=wipe_schedule['hour'],
+                                           minute=wipe_schedule['minute'], 
+                                           second=0, microsecond=0)
+                else:
+                    first_day = now.replace(month=now.month + 1, day=1,
+                                           hour=wipe_schedule['hour'],
+                                           minute=wipe_schedule['minute'],
+                                           second=0, microsecond=0)
+                
+                days_until_target = (target_day - first_day.weekday()) % 7
+                first_thursday = first_day + datetime.timedelta(days=days_until_target)
+            
+            return first_thursday
+            
+        else:  # weekly
+            days_ahead = wipe_schedule['day_of_week'] - now.weekday()
+            
+            if days_ahead < 0:
+                days_ahead += 7
+            elif days_ahead == 0:
+                wipe_time_today = now.replace(
+                    hour=wipe_schedule['hour'],
+                    minute=wipe_schedule['minute'],
+                    second=0,
+                    microsecond=0
+                )
+                if now >= wipe_time_today:
+                    days_ahead = 7
+            
+            next_wipe = now + datetime.timedelta(days=days_ahead)
+            next_wipe = next_wipe.replace(
                 hour=wipe_schedule['hour'],
                 minute=wipe_schedule['minute'],
                 second=0,
                 microsecond=0
             )
-            if now >= wipe_time_today:
-                days_ahead = 7  # Next week
-        
-        next_wipe = now + datetime.timedelta(days=days_ahead)
-        next_wipe = next_wipe.replace(
-            hour=wipe_schedule['hour'],
-            minute=wipe_schedule['minute'],
-            second=0,
-            microsecond=0
-        )
-        
-        return next_wipe
+            
+            return next_wipe
     
     async def send_wipe_poll(self, server_name: str, wipe_time: datetime.datetime):
         """Send wipe type poll to Discord"""
