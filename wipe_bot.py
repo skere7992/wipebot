@@ -285,10 +285,11 @@ class WipeAnnouncerBot(commands.Bot):
             self.servers[server.name] = server
     
     def setup_database(self):
-        """Initialize SQLite database"""
+        """Initialize SQLite database with migrations"""
         self.db_conn = sqlite3.connect(DB_FILE)
         cursor = self.db_conn.cursor()
         
+        # Create tables with IF NOT EXISTS
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS wipe_polls (
                 server_name TEXT PRIMARY KEY,
@@ -308,11 +309,18 @@ class WipeAnnouncerBot(commands.Bot):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_name TEXT NOT NULL,
                 wipe_type TEXT NOT NULL,
-                set_by TEXT,
                 executed_at TIMESTAMP,
                 success BOOLEAN
             )
         ''')
+        
+        # Migration: Add set_by column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE wipe_history ADD COLUMN set_by TEXT")
+            logger.info("Added set_by column to wipe_history table")
+        except sqlite3.OperationalError:
+            # Column already exists, ignore
+            pass
         
         self.db_conn.commit()
     
